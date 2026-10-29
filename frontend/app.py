@@ -1,7 +1,20 @@
-import os
+import sys
+import sqlite3
+from pathlib import Path
 
-import requests
 import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from database.db import (
+    get_research_by_id,
+    get_research_history,
+    initialize_database,
+    save_research,
+)
+from workflow.graph import run_research
 
 
 # ==================================================
@@ -15,20 +28,11 @@ st.set_page_config(
 )
 
 
-# ==================================================
-# 2. API configuration
-# ==================================================
-
-API_URL = os.getenv(
-    "RESEARCHX_API_URL",
-    "http://127.0.0.1:8000",
-).rstrip("/")
-
-REQUEST_TIMEOUT = 600
+initialize_database()
 
 
 # ==================================================
-# 3. Session state
+# 2. Session state
 # ==================================================
 
 if "research_topic" not in st.session_state:
@@ -42,34 +46,8 @@ if "research_id" not in st.session_state:
 
 
 # ==================================================
-# 4. Helper functions
+# 3. Helper functions
 # ==================================================
-
-def fetch_history():
-    """Retrieve previous research tasks from FastAPI."""
-
-    response = requests.get(
-        f"{API_URL}/history",
-        timeout=15,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def fetch_report(research_id: int):
-    """Retrieve a previously saved research report."""
-
-    response = requests.get(
-        f"{API_URL}/history/{research_id}",
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
 
 def format_timestamp(timestamp: str) -> str:
     """Format an ISO timestamp for display."""
@@ -81,9 +59,8 @@ def format_timestamp(timestamp: str) -> str:
 
 
 # ==================================================
-# 5. Sidebar: Research history
+# 4. Sidebar: Research history
 # ==================================================
-
 with st.sidebar:
     st.title("📚 Research History")
 
@@ -95,7 +72,7 @@ with st.sidebar:
 
     try:
         if "history_cache" not in st.session_state:
-            st.session_state.history_cache = fetch_history()
+            st.session_state.history_cache = get_research_history()
 
         history = st.session_state.history_cache
 
@@ -122,34 +99,33 @@ with st.sidebar:
                         use_container_width=True,
                     ):
                         try:
-                            saved_report = fetch_report(research_id)
+                            saved_report = get_research_by_id(research_id)
+                            if saved_report is None:
+                                st.error("Unable to open report: report not found.")
+                            else:
+                                st.session_state.research_id = (
+                                    saved_report["id"]
+                                )
+                                st.session_state.research_topic = (
+                                    saved_report["topic"]
+                                )
+                                st.session_state.research_report = (
+                                    saved_report["report"]
+                                )
 
-                            st.session_state.research_id = (
-                                saved_report["id"]
-                            )
-                            st.session_state.research_topic = (
-                                saved_report["topic"]
-                            )
-                            st.session_state.research_report = (
-                                saved_report["report"]
-                            )
+                                st.rerun()
 
-                            st.rerun()
-
-                        except requests.RequestException as error:
+                        except sqlite3.Error as error:
                             st.error(
-                                f"Unable to open report: {error}"
+                                f"Unable to load the saved report: {error}"
                             )
 
-    except requests.RequestException:
-        st.warning(
-            "Cannot load research history. "
-            "Make sure the FastAPI backend is running."
-        )
+    except sqlite3.Error as error:
+        st.error(f"Cannot load research history: {error}")
 
 
 # ==================================================
-# 6. Main dashboard
+# 5. Main dashboard
 # ==================================================
 
 st.title("🔬 ResearchX AI")
@@ -170,7 +146,7 @@ st.divider()
 
 
 # ==================================================
-# 7. Research input
+# 6. Research input
 # ==================================================
 
 st.subheader("📝 Start a New Research Task")
@@ -196,7 +172,7 @@ st.caption(
 
 
 # ==================================================
-# 8. Run the research workflow
+# 7. Run the research workflow
 # ==================================================
 
 if st.button(
@@ -212,19 +188,16 @@ if st.button(
             with st.spinner(
                 "ResearchX AI is researching and preparing your report..."
             ):
-                response = requests.post(
-                    f"{API_URL}/research",
-                    json={"topic": topic.strip()},
-                    timeout=REQUEST_TIMEOUT,
+                result = run_research(topic.strip())
+                report = result["final_report"]
+                research_id = save_research(
+                    topic=topic.strip(),
+                    report=report,
                 )
 
-                response.raise_for_status()
-
-                data = response.json()
-
-            st.session_state.research_id = data.get("id")
-            st.session_state.research_topic = data["topic"]
-            st.session_state.research_report = data["report"]
+            st.session_state.research_id = research_id
+            st.session_state.research_topic = topic.strip()
+            st.session_state.research_report = report
 
             # Invalidate the cached history after saving a new report.
             st.session_state.pop("history_cache", None)
@@ -234,28 +207,8 @@ if st.button(
             # Reload the page to refresh the sidebar.
             st.rerun()
 
-        except requests.exceptions.Timeout:
-            st.error(
-                "The research request timed out. "
-                "Check the backend terminal before retrying."
-            )
-
-        except requests.exceptions.ConnectionError:
-            st.error(
-                "Cannot connect to the FastAPI backend. "
-                "Start the backend and try again."
-            )
-
-        except requests.exceptions.HTTPError as error:
-            st.error(
-                f"The backend returned an HTTP error: {error}"
-            )
-
-        except requests.exceptions.RequestException as error:
-            st.error(f"Research request failed: {error}")
-
-        except (KeyError, ValueError) as error:
-            st.error(f"Unexpected API response: {error}")
+        except Exception as error:
+            st.error(f"Research failed: {error}")
 
 
 # ==================================================
@@ -303,6 +256,5 @@ st.divider()
 
 st.caption(
     "ResearchX AI | Gemini • LangGraph • MCP • Tavily "
-    "• FastAPI • Streamlit • SQLite"
+    "• Streamlit • SQLite"
 )
-
